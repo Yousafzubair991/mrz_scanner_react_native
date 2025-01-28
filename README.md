@@ -1,0 +1,1 @@
+# mrz_scanner_react_native
