@@ -1,36 +1,29 @@
-/**
- * Sample React Native App
- * https://github.com/facebook/react-native
- *
- * @format
- */
-
 import {Button, SafeAreaView, ScrollView, StyleSheet, Text} from 'react-native';
 import {Camera, useCameraDevice} from 'react-native-vision-camera';
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 
 import TextRecognition from '@react-native-ml-kit/text-recognition';
+import {calculateChecksum} from './src/util/checksum';
 import {checkCameraPermission} from './src/util/permission';
 import {parse} from 'mrz';
 
 function App(): JSX.Element {
   const device = useCameraDevice('back');
   const ref = useRef<Camera>(null);
-  const [mrzText, setmrzText] = useState(null);
-  const [mrz, setmrz] = useState(null);
-  const [isCapturing, setIsCapturing] = useState(false);
-  const [intervalId, setIntervalId] = useState(null);
+  const [mrzText, setmrzText] = useState<string | null>(null);
+  const [mrz, setmrz] = useState<string | null>(null);
+  const [isCapturing, setIsCapturing] = useState<boolean>(false);
+  const [hasPermission, setHasPermission] = useState<boolean>(false);
+  const [message, setmessage] = useState<string | null>(null);
 
+  // Stop capturing
   const stopCapturing = useCallback(() => {
     setIsCapturing(false);
-    if (intervalId) {
-      clearInterval(intervalId);
-      setIntervalId(null);
-    }
-  }, [intervalId]);
+  }, []);
 
+  // Extract MRZ from image
   const extractMRZ = useCallback(
-    async (imagePath: string) => {
+    async (imagePath: string): Promise<string | null> => {
       try {
         const result = await TextRecognition.recognize(imagePath);
         const mrzLines = [];
@@ -44,63 +37,150 @@ function App(): JSX.Element {
           }
         }
         if (mrzLines.length === 3 || mrzLines.length === 2) {
-          const mrzObject = parse(mrzLines.join('\n'), {
-            autocorrect: true,
-          })?.fields;
-          if (mrzObject) {
-            console.log('MRZ:', mrzObject);
-            setmrz(mrzLines.join('\n'));
-            setmrzText(JSON.stringify(mrzObject, null, 2));
-            stopCapturing();
-            return mrzObject;
-          } else {
-            console.log('MRZ not found or incomplete. Found lines:', mrzLines);
-            setmrzText(null);
-            return null;
-          }
+          return mrzLines.join('\n');
         } else {
           console.log('MRZ not found or incomplete. Found lines:', mrzLines);
-          setmrzText(null);
+          setmessage('❌ MRZ Not Found');
           return null;
         }
       } catch (error) {
+        console.log('Error extracting MRZ:', error);
+        setmessage('❌ Error Extracting');
         return null;
       }
     },
-    [setmrz, setmrzText, stopCapturing],
+    [setmessage],
+  );
+
+  // Decode MRZ and validate checksums
+  const decodeMRZ = useCallback(
+    (mrzData: string) => {
+      const mrzObject = parse(mrzData, {autocorrect: true})?.fields;
+
+      if (mrzObject) {
+        const isValid = calculateChecksum(
+          mrzObject?.documentNumber,
+          mrzObject?.documentNumberCheckDigit,
+        );
+        const isValidBirth = calculateChecksum(
+          mrzObject?.birthDate,
+          mrzObject?.birthDateCheckDigit,
+        );
+        const isValidExp = calculateChecksum(
+          mrzObject?.expirationDate,
+          mrzObject?.expirationDateCheckDigit,
+        );
+        if (!isValid || !isValidBirth || !isValidExp) {
+          setmrzText(null);
+          setmessage('❌ Invalid Checksum');
+          return null;
+        }
+        setmrz(JSON.stringify(mrzData));
+        setmrzText(JSON.stringify(mrzObject, null, 2));
+        stopCapturing();
+      }
+    },
+    [stopCapturing],
   );
 
   const startCapturing = useCallback(() => {
+    // Check if camera device is available and permission is granted before starting
+    if (!device) {
+      setmessage('❌ Camera Device Not Available');
+      stopCapturing();
+      return;
+    }
+
+    if (!hasPermission) {
+      setmessage('❌ Camera Permission Not Granted');
+      return;
+    }
+
     setmrzText(null);
     setmrz(null);
     setIsCapturing(true);
-    const id = setInterval(async () => {
-      if (ref.current) {
-        try {
+    let retryCount = 0;
+    let previousMRZ: any = null;
+
+    const captureAndValidate = async (): Promise<void> => {
+      try {
+        if (retryCount >= 10) {
+          setmessage('❌ ID Capture Failed');
+          stopCapturing();
+          return;
+        }
+
+        if (ref.current && device) {
+          setmessage('📷 Capturing photo');
           const photo = await ref.current.takePhoto({
             flash: 'off',
             enableShutterSound: false,
           });
-          extractMRZ('file://' + photo.path);
-        } catch (error) {
-          console.error('Error capturing image:', error);
+
+          setmessage('Processing...');
+          const currentMRZ = await extractMRZ('file://' + photo.path);
+
+          if (!currentMRZ) {
+            // if no mrz found capture again
+            retryCount++;
+            setmessage('Hold Your ID Steady');
+            captureAndValidate();
+          } else if (!previousMRZ) {
+            // if no previous mrz set the current mrz
+            previousMRZ = currentMRZ;
+            setmessage('Hold Steady');
+            captureAndValidate();
+          } else if (previousMRZ && previousMRZ !== currentMRZ) {
+            // if previous mrz is not equal to current mrz, set the current mrz
+            retryCount++;
+            previousMRZ = currentMRZ;
+            captureAndValidate();
+          } else {
+            // if previous mrz is equal to current mrz, stop capturing and decode mrz
+            setmessage('✅ Capture Success');
+            decodeMRZ(currentMRZ);
+            stopCapturing();
+          }
+        } else {
+          setmessage('❌ Camera Not Ready');
         }
+      } catch (error) {
+        console.log('Error capturing image:', error);
+        retryCount++;
+        setmessage('❌ Error Occurred');
+        captureAndValidate();
       }
-    }, 2500);
-    setIntervalId(id);
-  }, [extractMRZ, ref]);
+    };
+
+    // Start the capture process with a small delay to ensure camera is ready
+    setTimeout(() => {
+      captureAndValidate();
+    }, 500);
+  }, [
+    decodeMRZ,
+    stopCapturing,
+    device,
+    hasPermission,
+    setmessage,
+    extractMRZ,
+    ref,
+  ]);
 
   useEffect(() => {
-    checkCameraPermission();
+    const initializeCamera = async () => {
+      await checkCameraPermission();
+      setHasPermission(true); // Assume permissions are granted after check
+    };
+    initializeCamera();
     return () => {};
   }, []);
 
   return (
-    <SafeAreaView style={{flex: 1}}>
+    <SafeAreaView style={styles.container}>
       <ScrollView
         contentInsetAdjustmentBehavior="automatic"
         style={styles.scrollView}>
-        {isCapturing && device && (
+        {isCapturing && device && hasPermission && (
           <Camera
             ref={ref}
             style={styles.camera}
@@ -109,19 +189,24 @@ function App(): JSX.Element {
             photo={true}
           />
         )}
+        {mrz && <Text style={styles?.title}>MRZ Data:</Text>}
         <Text style={styles?.mrz}>{mrz}</Text>
+        {mrzText && <Text style={styles?.title}>MRZ Text:</Text>}
         <Text style={styles?.mrz}>{mrzText}</Text>
-
         <Button
           title={isCapturing ? 'Stop Capturing' : 'Start Capturing'}
           onPress={isCapturing ? stopCapturing : startCapturing}
         />
+        <Text style={styles?.message}>{message}</Text>
       </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
   scrollView: {
     marginHorizontal: 20,
   },
@@ -134,6 +219,19 @@ const styles = StyleSheet.create({
   },
   mrz: {
     fontSize: 20,
+    color: 'black',
+    marginTop: 20,
+  },
+  message: {
+    fontSize: 16,
+    color: 'red',
+    marginTop: 20,
+    alignSelf: 'center',
+    textTransform: 'uppercase',
+  },
+  title: {
+    fontSize: 20,
+    fontWeight: 'bold',
     color: 'black',
     marginTop: 20,
   },
